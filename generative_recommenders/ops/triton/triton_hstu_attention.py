@@ -482,31 +482,20 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
     seq_offsets,
     num_targets,
     Out,
-    stride_qm,
     stride_qh,
-    stride_kn,
     stride_kh,
-    stride_vn,
     stride_vh,
-    stride_om,
     stride_oh,
     alpha,
     MAX_SEQ_LEN,
-    DeltaSize,
-    contextual_seq_len,
-    max_attn_len,
     off_z,
     off_h,
     pid,
-    HAS_MULTIPLE_TARGETS: tl.constexpr,
-    IS_DELTA_Q: tl.constexpr,
     ALLOW_TF32: tl.constexpr,
     BLOCK_D_Q: tl.constexpr,
     BLOCK_D_V: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    HAS_CONTEXTUAL_SEQ_LEN: tl.constexpr,
-    HAS_MAX_ATTN_LEN: tl.constexpr,
 ):
     seq_start = tl.load(seq_offsets + off_z).to(tl.int64)
     off_h = off_h.to(tl.int64)
@@ -514,100 +503,99 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
     seq_end = tl.load(seq_offsets + off_z + 1)
     seq_len = (seq_end - seq_start).to(tl.int32)
 
-    if IS_DELTA_Q:
-        start_m_delta = pid * BLOCK_M
-        start_m = (start_m_delta + seq_len - DeltaSize).to(tl.int32)
-    else:
-        start_m_delta = 0
-        start_m = pid * BLOCK_M
-    if start_m < seq_len:
-        if HAS_MULTIPLE_TARGETS:
-            n_targets = tl.load(num_targets + off_z).to(tl.int32)
-        else:
-            n_targets = None
 
-        # initialize offsets
-        offs_m = start_m + tl.arange(0, BLOCK_M)
-        offs_n = tl.arange(0, BLOCK_N)
-        K_block_ptr = None
-        V_block_ptr = None
-        device_desc_k = tl.make_tensor_descriptor(
-            K,
-            shape=[seq_end.to(tl.int32), H * DimQ],
-            strides=[H * DimQ, 1],
-            block_shape=[BLOCK_N, BLOCK_D_Q],
+    start_m = pid * BLOCK_M
+    if start_m >= seq_len:
+        return
+    n_targets = tl.load(num_targets + off_z).to(tl.int32)
+    # initialize offsets
+    offs_m = start_m + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    device_desc_k = tl.make_tensor_descriptor(
+        K,
+        shape=[seq_end.to(tl.int32), H * DimQ],
+        strides=[H * DimQ, 1],
+        block_shape=[BLOCK_N, BLOCK_D_Q],
+    )
+
+    device_desc_v = tl.make_tensor_descriptor(
+        V,
+        shape=[seq_end.to(tl.int32), H * DimV],
+        strides=[H * DimV, 1],
+        block_shape=[BLOCK_N, BLOCK_D_V],
+    )
+
+    device_desc_q = tl.make_tensor_descriptor(
+        Q,
+        shape=[seq_end.to(tl.int32), H * DimQ],
+        strides=[H * DimQ, 1],
+        block_shape=[BLOCK_M, BLOCK_D_Q],
+    )
+    q = device_desc_q.load(
+        [
+            (seq_start + start_m).to(tl.int32),
+            (off_h * stride_qh).to(tl.int32),
+        ]
+    )
+
+    acc = tl.zeros([BLOCK_M, BLOCK_D_V], dtype=tl.float32)
+    uih_end = seq_len - n_targets
+    low = 0
+    high = start_m + BLOCK_M
+    uih_end = (uih_end + BLOCK_N - 1) // BLOCK_N * BLOCK_N
+    if uih_end < start_m:
+        high = seq_len - n_targets
+
+    end_n = low
+    orignal_off_n = offs_n
+    orignal_off_m = offs_m
+    offset_kh = off_h * stride_kh
+    offset_vh = off_h * stride_vh
+    for start in range(low, high, BLOCK_N):
+        start_n = tl.multiple_of(start, BLOCK_N)
+        offs_n = orignal_off_n + start_n
+        offs_m = orignal_off_m
+
+        # -- compute qk ----
+        k = device_desc_k.load(
+            [(seq_start + start_n).to(tl.int32), offset_kh.to(tl.int32)],
         )
-
-        device_desc_v = tl.make_tensor_descriptor(
-            V,
-            shape=[seq_end.to(tl.int32), H * DimV],
-            strides=[H * DimV, 1],
-            block_shape=[BLOCK_N, BLOCK_D_V],
+        # tma can only be loaded in one order, use trans afterwards
+        qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32) * alpha
+        invalid_mask = offs_m[:, None] == offs_n[None, :]
+        max_ids = seq_len
+        max_ids = max_ids - n_targets
+        offs_m = tl.where(
+            offs_m < max_ids,
+            offs_m,
+            max_ids,
         )
+        offs_n = tl.where(
+            offs_n < max_ids,
+            offs_n,
+            max_ids,
+        )
+        offs_m_minus_n = offs_m[:, None] - offs_n[None, :]
+        invalid_mask = invalid_mask or (offs_m_minus_n > 0)
+        silu = fast_dividef(qk, 1.0 + tl.exp(-qk)) * (1.0 / MAX_SEQ_LEN)
+        silu = tl.where(invalid_mask, silu, 0)
+        v = device_desc_v.load(
+            [(seq_start + start_n).to(tl.int32), offset_vh.to(tl.int32)],
+        )
+        silu = silu.to(v.dtype)
+        acc += tl.dot(silu, v, allow_tf32=ALLOW_TF32)
+        end_n += BLOCK_N
 
-        if IS_DELTA_Q:
-            device_desc_q = tl.make_tensor_descriptor(
-                Q,
-                shape=[(off_z * DeltaSize + DeltaSize).to(tl.int32), H * DimQ],
-                strides=[H * DimQ, 1],
-                block_shape=[BLOCK_M, BLOCK_D_Q],
-            )
-
-            q = device_desc_q.load(
-                [
-                    (off_z * DeltaSize + start_m_delta).to(tl.int32),
-                    (off_h * stride_qh).to(tl.int32),
-                ]
-            )
-        else:
-            device_desc_q = tl.make_tensor_descriptor(
-                Q,
-                shape=[seq_end.to(tl.int32), H * DimQ],
-                strides=[H * DimQ, 1],
-                block_shape=[BLOCK_M, BLOCK_D_Q],
-            )
-            q = device_desc_q.load(
-                [
-                    (seq_start + start_m).to(tl.int32),
-                    (off_h * stride_qh).to(tl.int32),
-                ]
-            )
-
-        acc = tl.zeros([BLOCK_M, BLOCK_D_V], dtype=tl.float32)
-        if HAS_MULTIPLE_TARGETS:
-            uih_end = seq_len - n_targets
-        else:
-            uih_end = seq_len
-        if HAS_CONTEXTUAL_SEQ_LEN is True and start_m < contextual_seq_len:
-            # uih_end must be larger than start_m
-            low = 0
-            high = seq_len
-        else:
-            low = 0
-            high = start_m + BLOCK_M
-            if HAS_MAX_ATTN_LEN:
-                if start_m > uih_end:
-                    low = uih_end - max_attn_len
-                else:
-                    low = start_m - max_attn_len
-                if HAS_CONTEXTUAL_SEQ_LEN:
-                    low = low if low > contextual_seq_len else 0
-                else:
-                    low = low if low > 0 else 0
-            if HAS_MULTIPLE_TARGETS:
-                uih_end = (uih_end + BLOCK_N - 1) // BLOCK_N * BLOCK_N
-                if uih_end < start_m:
-                    high = seq_len - n_targets
-
-        end_n = low
-        orignal_off_n = offs_n
-        orignal_off_m = offs_m
-        for start in range(low, high, BLOCK_N):
-            start_n = tl.multiple_of(start, BLOCK_N)
+    # pyre-ignore[61]
+    if uih_end < start_m:
+        low_delta = start_m
+        high_delta = start_m + BLOCK_M
+        for start_delta in tl.range(
+            low_delta, high_delta, BLOCK_N, num_stages=0
+        ):
+            start_n = tl.multiple_of(start_delta, BLOCK_N)
             offs_n = orignal_off_n + start_n
             offs_m = orignal_off_m
-            offset_kh = off_h * stride_kh
-            offset_vh = off_h * stride_vh
             # -- compute qk ----
             k = device_desc_k.load(
                 [(seq_start + start_n).to(tl.int32), offset_kh.to(tl.int32)],
@@ -616,20 +604,6 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
             qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32) * alpha
             invalid_mask = offs_m[:, None] == offs_n[None, :]
             max_ids = seq_len
-            if HAS_CONTEXTUAL_SEQ_LEN:
-                offs_m = offs_m - contextual_seq_len + 1
-                offs_m = tl.where(
-                    offs_m > 0,
-                    offs_m,
-                    0,
-                )
-                offs_n = offs_n - contextual_seq_len + 1
-                offs_n = tl.where(
-                    offs_n > 0,
-                    offs_n,
-                    0,
-                )
-                max_ids = max_ids - contextual_seq_len + 1
             max_ids = max_ids - n_targets
             offs_m = tl.where(
                 offs_m < max_ids,
@@ -643,12 +617,6 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
             )
             offs_m_minus_n = offs_m[:, None] - offs_n[None, :]
             invalid_mask = invalid_mask or (offs_m_minus_n > 0)
-            if HAS_MAX_ATTN_LEN:
-                invalid_mask = invalid_mask and offs_m_minus_n <= max_attn_len
-            if HAS_CONTEXTUAL_SEQ_LEN:
-                invalid_mask = invalid_mask or (
-                    offs_m[:, None] == 0 and offs_n[None, :] < max_ids
-                )
             silu = fast_dividef(qk, 1.0 + tl.exp(-qk)) * (1.0 / MAX_SEQ_LEN)
             silu = tl.where(invalid_mask, silu, 0)
             v = device_desc_v.load(
@@ -656,78 +624,24 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
             )
             silu = silu.to(v.dtype)
             acc += tl.dot(silu, v, allow_tf32=ALLOW_TF32)
-            end_n += BLOCK_N
 
-        # pyre-ignore[61]
-        if uih_end < start_m:
-            low_delta = start_m
-            high_delta = start_m + BLOCK_M
-            offset = (low_delta - end_n).to(tl.int32)
-            for start_delta in tl.range(
-                low_delta, high_delta, BLOCK_N, num_stages=0
-            ):
-                acc += _hstu_attn_fwd_one_block(
-                    start_n=start_delta,
-                    seq_len=seq_len,
-                    offs_m=orignal_off_m,
-                    offs_n=orignal_off_n + start_delta,
-                    q=q,
-                    K=K,
-                    V=V,
-                    K_block_ptr=K_block_ptr,
-                    V_block_ptr=V_block_ptr,
-                    device_desc_k=device_desc_k,
-                    device_desc_v=device_desc_v,
-                    offset_kh=off_h * stride_kh,
-                    offset_vh=off_h * stride_vh,
-                    seq_start=seq_start,
-                    n_targets=n_targets if HAS_MULTIPLE_TARGETS else None,
-                    alpha=alpha,
-                    MAX_SEQ_LEN=MAX_SEQ_LEN,
-                    contextual_seq_len=contextual_seq_len,
-                    max_attn_len=max_attn_len,
-                    HAS_MULTIPLE_TARGETS=HAS_MULTIPLE_TARGETS,
-                    HAS_CONTEXTUAL_SEQ_LEN=HAS_CONTEXTUAL_SEQ_LEN,
-                    HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
-                    ALLOW_TF32=ALLOW_TF32,
-                    BLOCK_D_Q=BLOCK_D_Q,
-                    BLOCK_D_V=BLOCK_D_V,
-                    BLOCK_N=BLOCK_N,
-                    ENABLE_TMA=True,
-                )
-
-        # Important: must cast to proper dtype. If acc is float32, but
-        # TMA descriptor specifies float16, the program will run
-        # without crashes but produce wrong results.
-        acc = acc.to(Out.dtype.element_ty)
-        if IS_DELTA_Q:
-            device_desc_o = tl.make_tensor_descriptor(
-                Out,
-                shape=[(off_z * DeltaSize + DeltaSize).to(tl.int32), H * DimV],
-                strides=[H * DimV, 1],
-                block_shape=[BLOCK_M, BLOCK_D_V],
-            )
-            device_desc_o.store(
-                [
-                    (off_z * DeltaSize + pid * BLOCK_M).to(tl.int32),
-                    (off_h * stride_oh).to(tl.int32),
-                ],
-                acc,
-            )
-        else:
-            device_desc_o = tl.make_tensor_descriptor(
-                Out,
-                shape=[seq_end.to(tl.int32), H * DimV],
-                strides=[H * DimV, 1],
-                block_shape=[BLOCK_M, BLOCK_D_V],
-            )
-            device_desc_o.store(
-                [
-                    (seq_start + pid * BLOCK_M).to(tl.int32),
-                    (off_h * stride_oh).to(tl.int32),
-                ],
-                acc,
-            )
+    # Important: must cast to proper dtype. If acc is float32, but
+    # TMA descriptor specifies float16, the program will run
+    # without crashes but produce wrong results.
+    acc = acc.to(Out.dtype.element_ty)
+    device_desc_o = tl.make_tensor_descriptor(
+        Out,
+        shape=[seq_end.to(tl.int32), H * DimV],
+        strides=[H * DimV, 1],
+        block_shape=[BLOCK_M, BLOCK_D_V],
+    )
+    device_desc_o.store(
+        [
+            (seq_start + pid * BLOCK_M).to(tl.int32),
+            (off_h * stride_oh).to(tl.int32),
+        ],
+        acc,
+    )
 
 @triton_autotune(
     configs=_get_fw_configs(),
@@ -791,7 +705,11 @@ def _hstu_attn_fwd(  # noqa C901
     off_h = off_hz % H
     pid = tl.program_id(0)
     if USE_TLX:
+        tl.static_assert(HAS_CONTEXTUAL_SEQ_LEN is False)
+        tl.static_assert(HAS_MAX_ATTN_LEN is False)
+        tl.static_assert(IS_DELTA_Q is False)
         tl.static_assert(HAS_MULTIPLE_TARGETS is True)
+
         _hstu_attn_fwd_compute_tlx(
             Q=Q,
             K=K,
@@ -802,29 +720,18 @@ def _hstu_attn_fwd(  # noqa C901
             seq_offsets=seq_offsets,
             num_targets=num_targets,
             Out=Out,
-            stride_qm=stride_qm,
             stride_qh=stride_qh,
-            stride_kn=stride_kn,
             stride_kh=stride_kh,
-            stride_vn=stride_vn,
             stride_vh=stride_vh,
-            stride_om=stride_om,
             stride_oh=stride_oh,
             alpha=alpha,
             MAX_SEQ_LEN=MAX_SEQ_LEN,
-            DeltaSize=DeltaSize,
-            contextual_seq_len=contextual_seq_len,
-            max_attn_len=max_attn_len,
             off_z=off_z,
             off_h=off_h,
             pid=pid,
-            HAS_MULTIPLE_TARGETS=HAS_MULTIPLE_TARGETS,
-            IS_DELTA_Q=IS_DELTA_Q,
             ALLOW_TF32=ALLOW_TF32,
             BLOCK_D_Q=BLOCK_D_Q,
             BLOCK_D_V=BLOCK_D_V,
-            HAS_CONTEXTUAL_SEQ_LEN=HAS_CONTEXTUAL_SEQ_LEN,
-            HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
         )
