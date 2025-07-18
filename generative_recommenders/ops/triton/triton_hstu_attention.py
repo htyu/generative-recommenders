@@ -520,34 +520,62 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
                     high = seq_len - n_targets
 
         end_n = low
-        for start_n in range(low, high, BLOCK_N):
-            acc += _hstu_attn_fwd_one_block(
-                start_n=start_n,
-                seq_len=seq_len,
-                offs_m=offs_m,
-                offs_n=offs_n + start_n,
-                q=q,
-                K=K,
-                V=V,
-                K_block_ptr=K_block_ptr,
-                V_block_ptr=V_block_ptr,
-                offset_kh=off_h * stride_kh,
-                offset_vh=off_h * stride_vh,
-                seq_start=seq_start,
-                n_targets=n_targets if HAS_MULTIPLE_TARGETS else None,
-                alpha=alpha,
-                MAX_SEQ_LEN=MAX_SEQ_LEN,
-                contextual_seq_len=contextual_seq_len,
-                max_attn_len=max_attn_len,
-                HAS_MULTIPLE_TARGETS=HAS_MULTIPLE_TARGETS,
-                HAS_CONTEXTUAL_SEQ_LEN=HAS_CONTEXTUAL_SEQ_LEN,
-                HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
-                ALLOW_TF32=ALLOW_TF32,
-                BLOCK_D_Q=BLOCK_D_Q,
-                BLOCK_D_V=BLOCK_D_V,
-                BLOCK_N=BLOCK_N,
-                ENABLE_TMA=True,
+        orignal_off_n = offs_n
+        orignal_off_m = offs_m
+        for start in range(low, high, BLOCK_N):
+            start_n = tl.multiple_of(start, BLOCK_N)
+            offs_n = orignal_off_n + start_n
+            offs_m = orignal_off_m
+            offset_kh = off_h * stride_kh
+            offset_vh = off_h * stride_vh
+            # -- compute qk ----
+            k = K.load(
+                [(seq_start + start_n).to(tl.int32), offset_kh.to(tl.int32)],
             )
+            # tma can only be loaded in one order, use trans afterwards
+            qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32) * alpha
+            invalid_mask = offs_m[:, None] == offs_n[None, :]
+            max_ids = seq_len
+            if HAS_CONTEXTUAL_SEQ_LEN:
+                offs_m = offs_m - contextual_seq_len + 1
+                offs_m = tl.where(
+                    offs_m > 0,
+                    offs_m,
+                    0,
+                )
+                offs_n = offs_n - contextual_seq_len + 1
+                offs_n = tl.where(
+                    offs_n > 0,
+                    offs_n,
+                    0,
+                )
+                max_ids = max_ids - contextual_seq_len + 1
+            max_ids = max_ids - n_targets
+            offs_m = tl.where(
+                offs_m < max_ids,
+                offs_m,
+                max_ids,
+            )
+            offs_n = tl.where(
+                offs_n < max_ids,
+                offs_n,
+                max_ids,
+            )
+            offs_m_minus_n = offs_m[:, None] - offs_n[None, :]
+            invalid_mask = invalid_mask or (offs_m_minus_n > 0)
+            if HAS_MAX_ATTN_LEN:
+                invalid_mask = invalid_mask and offs_m_minus_n <= max_attn_len
+            if HAS_CONTEXTUAL_SEQ_LEN:
+                invalid_mask = invalid_mask or (
+                    offs_m[:, None] == 0 and offs_n[None, :] < max_ids
+                )
+            silu = fast_dividef(qk, 1.0 + tl.exp(-qk)) * (1.0 / MAX_SEQ_LEN)
+            silu = tl.where(invalid_mask, silu, 0)
+            v = V.load(
+                [(seq_start + start_n).to(tl.int32), offset_vh.to(tl.int32)],
+            )
+            silu = silu.to(v.dtype)
+            acc += tl.dot(silu, v, allow_tf32=ALLOW_TF32)
             end_n += BLOCK_N
 
         # pyre-ignore[61]
@@ -561,8 +589,8 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
                 acc += _hstu_attn_fwd_one_block(
                     start_n=start_delta,
                     seq_len=seq_len,
-                    offs_m=offs_m,
-                    offs_n=offs_n + start_delta,
+                    offs_m=orignal_off_m,
+                    offs_n=orignal_off_n + start_delta,
                     q=q,
                     K=K,
                     V=V,
