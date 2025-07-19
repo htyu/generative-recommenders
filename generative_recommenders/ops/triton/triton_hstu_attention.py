@@ -477,6 +477,7 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
     v_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=NUM_MMA_GROUPS)
     v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
 
+    n_targets = tl.load(num_targets + off_z).to(tl.int32)
 
 
     with tlx.async_tasks():
@@ -484,38 +485,79 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
         with tlx.async_task("default"):
 
             # load q: it will stay in SRAM throughout
-            for cid in tl.range(0, NUM_MMA_GROUPS, loop_unroll_factor=NUM_MMA_GROUPS):
-                q_full = tlx.local_view(q_fulls, cid)
-                tlx.barrier_expect_bytes(q_full, 2 * BLOCK_M_SPLIT * BLOCK_D_Q)  # float16
-                q_tile = tlx.local_view(q_tiles, cid)
-                seq_offset = start_m + cid * BLOCK_M_SPLIT
-                tlx.async_descriptor_load(
-                    Q,
-                    q_tile,
-                    [
-                        (seq_start + seq_offset).to(tl.int32),
-                        (off_h * stride_qh).to(tl.int32),
-                    ],
-                    q_full
-                )
+            # for cid in tl.range(0, NUM_MMA_GROUPS, loop_unroll_factor=NUM_MMA_GROUPS):
+
+            cid = 0
+            q_full = tlx.local_view(q_fulls, cid)
+            tlx.barrier_expect_bytes(q_full, 2 * BLOCK_M_SPLIT * BLOCK_D_Q)  # float16
+            q_tile = tlx.local_view(q_tiles, cid)
+            seq_offset = start_m + cid * BLOCK_M_SPLIT
+            tlx.async_descriptor_load(
+                Q,
+                q_tile,
+                [
+                    (seq_start + seq_offset).to(tl.int32),
+                    (off_h * stride_qh).to(tl.int32),
+                ],
+                q_full
+            )
+
 
             off_h = off_h.to(tl.int64)
             off_z = off_z.to(tl.int64)
-            n_targets = tl.load(num_targets + off_z).to(tl.int32)
-
-            uih_end = seq_len - n_targets
-            low = 0
-            high = start_m + BLOCK_M
-            uih_end = (uih_end + BLOCK_N - 1) // BLOCK_N * BLOCK_N
-            if uih_end < start_m:
-                high = seq_len - n_targets
-
             offset_kh = off_h * stride_kh
             offset_vh = off_h * stride_vh
 
             kv_phase = 0
             acc_cnt = 0
-            for start in range(low, high, BLOCK_N):
+            buf_id = acc_cnt % NUM_BUFFERS
+            # buffers in a row share the same phase
+            kv_phase = kv_phase ^ (buf_id == 0)
+            start_n = 0
+
+            # wait for the K buffer to be released by the consumer
+            k_empty = tlx.local_view(k_empties, buf_id)
+            tlx.barrier_wait(k_empty, kv_phase)
+            # load K
+            k_full = tlx.local_view(k_fulls, buf_id)
+            k_tile = tlx.local_view(k_tiles, buf_id)
+            tlx.barrier_expect_bytes(k_full, 2 * BLOCK_N * BLOCK_D_Q)  # float16
+            tlx.async_descriptor_load(K, k_tile, [(seq_start + start_n).to(tl.int32), offset_kh.to(tl.int32)], k_full)
+
+
+            cid = 1
+            q_full = tlx.local_view(q_fulls, cid)
+            tlx.barrier_expect_bytes(q_full, 2 * BLOCK_M_SPLIT * BLOCK_D_Q)  # float16
+            q_tile = tlx.local_view(q_tiles, cid)
+            seq_offset = start_m + cid * BLOCK_M_SPLIT
+            tlx.async_descriptor_load(
+                Q,
+                q_tile,
+                [
+                    (seq_start + seq_offset).to(tl.int32),
+                    (off_h * stride_qh).to(tl.int32),
+                ],
+                q_full
+            )
+
+            # wait for the V buffer to be released by the consumer
+            v_empty = tlx.local_view(v_empties, buf_id)
+            tlx.barrier_wait(v_empty, kv_phase)
+            # load V
+            v_full = tlx.local_view(v_fulls, buf_id)
+            v_tile = tlx.local_view(v_tiles, buf_id)
+            tlx.barrier_expect_bytes(v_full, 2 * BLOCK_N * BLOCK_D_V)  # float16
+            tlx.async_descriptor_load(V, v_tile, [(seq_start + start_n).to(tl.int32), offset_vh.to(tl.int32)], v_full)
+
+
+            uih_end = seq_len - n_targets
+            high = start_m + BLOCK_M
+            uih_end = (uih_end + BLOCK_N - 1) // BLOCK_N * BLOCK_N
+            if uih_end < start_m:
+                high = seq_len - n_targets
+
+            acc_cnt += 1
+            for start in range(BLOCK_N, high, BLOCK_N):
                 buf_id = acc_cnt % NUM_BUFFERS
                 # buffers in a row share the same phase
                 kv_phase = kv_phase ^ (buf_id == 0)
@@ -580,7 +622,6 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
         with tlx.async_task(num_warps=NUM_MMA_WARPS_PER_GROUP, registers=232, replicate=NUM_MMA_GROUPS):
             cid = tlx.async_task_replica_id()
             acc = tl.zeros([BLOCK_M_SPLIT, BLOCK_D_V], dtype=tl.float32)
-            n_targets = tl.load(num_targets + off_z).to(tl.int32)
             # initialize offsets
             orignal_off_m = start_m + tl.arange(0, BLOCK_M_SPLIT) + cid * BLOCK_M_SPLIT
             orignal_off_n = tl.arange(0, BLOCK_N)
@@ -594,8 +635,6 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
 
             end_n = low
 
-            offset_kh = off_h * stride_kh
-            offset_vh = off_h * stride_vh
 
             # wait for the Q buffer to be populated by the producer
             q_full = tlx.local_view(q_fulls, cid)
@@ -669,6 +708,8 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
 
                 # tma can only be loaded in one order, use trans afterwards
                 k_tile = tlx.local_trans(k_tile)
+
+
                 qk = tlx.async_dot(q_tile, k_tile)
                 # wait for the MMA using to complete
                 prev_silu = silu
