@@ -64,11 +64,10 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
     else:
         configs = [
             triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 32, "USE_TLX": True, 'NUM_BUFFERS': 4, 'NUM_MMA_WARPS_PER_GROUP': 4, 'NUM_MMA_GROUPS': 1},
+                {"BLOCK_M": 128, "BLOCK_N": 64, "USE_TLX": True, 'NUM_BUFFERS': 2, 'NUM_MMA_WARPS_PER_GROUP': 4, 'NUM_MMA_GROUPS': 2},
                 num_stages=0,
                 num_warps=4,
             ),
-
         ]
     return configs
 
@@ -522,6 +521,7 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
     v_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=NUM_MMA_GROUPS)
     v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
 
+    n_targets = tl.load(num_targets + off_z).to(tl.int32)
 
 
     with tlx.async_tasks():
@@ -536,26 +536,66 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
             )
 
             # load q: it will stay in SRAM throughout
-            for cid in tl.range(0, NUM_MMA_GROUPS, loop_unroll_factor=NUM_MMA_GROUPS):
-                q_full = tlx.local_view(q_fulls, cid)
-                tlx.barrier_expect_bytes(q_full, 2 * BLOCK_M_SPLIT * BLOCK_D_Q)  # float16
-                q_tile = tlx.local_view(q_tiles, cid)
-                seq_offset = start_m + cid * BLOCK_M_SPLIT
-                tlx.async_descriptor_load(
-                    device_desc_q,
-                    q_tile,
-                    [
-                        (seq_start + seq_offset).to(tl.int32),
-                        (off_h * stride_qh).to(tl.int32),
-                    ],
-                    q_full
-                )
+            # for cid in tl.range(0, NUM_MMA_GROUPS, loop_unroll_factor=NUM_MMA_GROUPS):
+
+            cid = 0
+            q_full = tlx.local_view(q_fulls, cid)
+            tlx.barrier_expect_bytes(q_full, 2 * BLOCK_M_SPLIT * BLOCK_D_Q)  # float16
+            q_tile = tlx.local_view(q_tiles, cid)
+            seq_offset = start_m + cid * BLOCK_M_SPLIT
+            tlx.async_descriptor_load(
+                device_desc_q,
+                q_tile,
+                [
+                    (seq_start + seq_offset).to(tl.int32),
+                    (off_h * stride_qh).to(tl.int32),
+                ],
+                q_full
+            )
 
             device_desc_k = tl.make_tensor_descriptor(
                 K,
                 shape=[seq_end.to(tl.int32), H * DimQ],
                 strides=[H * DimQ, 1],
                 block_shape=[BLOCK_N, BLOCK_D_Q],
+            )
+
+
+            off_h = off_h.to(tl.int64)
+            off_z = off_z.to(tl.int64)
+            offset_kh = off_h * stride_kh
+            offset_vh = off_h * stride_vh
+
+            kv_phase = 0
+            acc_cnt = 0
+            buf_id = acc_cnt % NUM_BUFFERS
+            # buffers in a row share the same phase
+            kv_phase = kv_phase ^ (buf_id == 0)
+            start_n = 0
+
+            # wait for the K buffer to be released by the consumer
+            k_empty = tlx.local_view(k_empties, buf_id)
+            tlx.barrier_wait(k_empty, kv_phase)
+            # load K
+            k_full = tlx.local_view(k_fulls, buf_id)
+            k_tile = tlx.local_view(k_tiles, buf_id)
+            tlx.barrier_expect_bytes(k_full, 2 * BLOCK_N * BLOCK_D_Q)  # float16
+            tlx.async_descriptor_load(device_desc_k, k_tile, [(seq_start + start_n).to(tl.int32), offset_kh.to(tl.int32)], k_full)
+
+
+            cid = 1
+            q_full = tlx.local_view(q_fulls, cid)
+            tlx.barrier_expect_bytes(q_full, 2 * BLOCK_M_SPLIT * BLOCK_D_Q)  # float16
+            q_tile = tlx.local_view(q_tiles, cid)
+            seq_offset = start_m + cid * BLOCK_M_SPLIT
+            tlx.async_descriptor_load(
+                device_desc_q,
+                q_tile,
+                [
+                    (seq_start + seq_offset).to(tl.int32),
+                    (off_h * stride_qh).to(tl.int32),
+                ],
+                q_full
             )
 
             device_desc_v = tl.make_tensor_descriptor(
@@ -565,23 +605,24 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
                 block_shape=[BLOCK_N, BLOCK_D_V],
             )
 
-            off_h = off_h.to(tl.int64)
-            off_z = off_z.to(tl.int64)
-            n_targets = tl.load(num_targets + off_z).to(tl.int32)
+            # wait for the V buffer to be released by the consumer
+            v_empty = tlx.local_view(v_empties, buf_id)
+            tlx.barrier_wait(v_empty, kv_phase)
+            # load V
+            v_full = tlx.local_view(v_fulls, buf_id)
+            v_tile = tlx.local_view(v_tiles, buf_id)
+            tlx.barrier_expect_bytes(v_full, 2 * BLOCK_N * BLOCK_D_V)  # float16
+            tlx.async_descriptor_load(device_desc_v, v_tile, [(seq_start + start_n).to(tl.int32), offset_vh.to(tl.int32)], v_full)
+
 
             uih_end = seq_len - n_targets
-            low = 0
             high = start_m + BLOCK_M
             uih_end = (uih_end + BLOCK_N - 1) // BLOCK_N * BLOCK_N
             if uih_end < start_m:
                 high = seq_len - n_targets
 
-            offset_kh = off_h * stride_kh
-            offset_vh = off_h * stride_vh
-
-            kv_phase = 0
-            acc_cnt = 0
-            for start in range(low, high, BLOCK_N):
+            acc_cnt += 1
+            for start in range(BLOCK_N, high, BLOCK_N):
                 buf_id = acc_cnt % NUM_BUFFERS
                 # buffers in a row share the same phase
                 kv_phase = kv_phase ^ (buf_id == 0)
@@ -646,7 +687,6 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
         with tlx.async_task(num_warps=NUM_MMA_WARPS_PER_GROUP, registers=232, replicate=NUM_MMA_GROUPS):
             cid = tlx.async_task_replica_id()
             acc = tl.zeros([BLOCK_M_SPLIT, BLOCK_D_V], dtype=tl.float32)
-            n_targets = tl.load(num_targets + off_z).to(tl.int32)
             # initialize offsets
             orignal_off_m = start_m + tl.arange(0, BLOCK_M_SPLIT) + cid * BLOCK_M_SPLIT
             orignal_off_n = tl.arange(0, BLOCK_N)
@@ -660,8 +700,6 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
 
             end_n = low
 
-            offset_kh = off_h * stride_kh
-            offset_vh = off_h * stride_vh
 
             # wait for the Q buffer to be populated by the producer
             q_full = tlx.local_view(q_fulls, cid)
@@ -688,6 +726,8 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
 
                 # tma can only be loaded in one order, use trans afterwards
                 k_tile = tlx.local_trans(k_tile)
+
+
                 qk = tlx.async_dot(q_tile, k_tile)
                 # wait for the MMA using to complete
                 qk = tlx.async_dot_wait(0, qk)
@@ -801,16 +841,16 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
                     # increment loop trip counts
                     acc_cnt += 1
 
-            # Important: must cast to proper dtype. If acc is float32, but
+           # Important: must cast to proper dtype. If acc is float32, but
             # TMA descriptor specifies float16, the program will run
             # without crashes but produce wrong results.
-            acc = acc.to(tlx.dtype_of(Out))
             device_desc_o = tl.make_tensor_descriptor(
                 Out,
                 shape=[seq_end.to(tl.int32), H * DimV],
                 strides=[H * DimV, 1],
                 block_shape=[BLOCK_M_SPLIT, BLOCK_D_V],
             )
+            acc = acc.to(tlx.dtype_of(Out))
             seq_offset = pid * BLOCK_M + cid * BLOCK_M_SPLIT
             device_desc_o.store(
                 [
