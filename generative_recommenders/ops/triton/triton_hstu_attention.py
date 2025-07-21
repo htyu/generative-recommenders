@@ -23,6 +23,7 @@ import triton
 
 # @manual=//triton:triton
 import triton.language as tl
+import triton.tlx.language as tlx
 
 from generative_recommenders.common import (
     autotune_max_seq_len,
@@ -63,8 +64,8 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
     else:
         configs = [
             triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 32, "USE_TLX": True,},
-                num_stages=4,
+                {"BLOCK_M": 128, "BLOCK_N": 32, "USE_TLX": True, "NUM_BUFFERS" : 4},
+                num_stages=0,
                 num_warps=8,
             ),
 
@@ -376,50 +377,50 @@ def _hstu_attn_fwd_compute(  # noqa C901
                 V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
             end_n += BLOCK_N
 
-        if HAS_MULTIPLE_TARGETS:
-            # pyre-ignore[61]
-            if uih_end < start_m:
-                low_delta = start_m
-                high_delta = start_m + BLOCK_M
-                offset = (low_delta - end_n).to(tl.int32)
-                if not ENABLE_TMA:
-                    K_block_ptr = tl.advance(K_block_ptr, (0, offset))
-                    V_block_ptr = tl.advance(V_block_ptr, (offset, 0))
-                for start_delta in tl.range(
-                    low_delta, high_delta, BLOCK_N, num_stages=0
-                ):
-                    acc += _hstu_attn_fwd_one_block(
-                        start_n=start_delta,
-                        seq_len=seq_len,
-                        offs_m=offs_m,
-                        offs_n=offs_n + start_delta,
-                        q=q,
-                        K=K,
-                        V=V,
-                        K_block_ptr=K_block_ptr,
-                        V_block_ptr=V_block_ptr,
-                        device_desc_k=device_desc_k,
-                        device_desc_v=device_desc_v,
-                        offset_kh=off_h * stride_kh,
-                        offset_vh=off_h * stride_vh,
-                        seq_start=seq_start,
-                        n_targets=n_targets if HAS_MULTIPLE_TARGETS else None,
-                        alpha=alpha,
-                        MAX_SEQ_LEN=MAX_SEQ_LEN,
-                        contextual_seq_len=contextual_seq_len,
-                        max_attn_len=max_attn_len,
-                        HAS_MULTIPLE_TARGETS=HAS_MULTIPLE_TARGETS,
-                        HAS_CONTEXTUAL_SEQ_LEN=HAS_CONTEXTUAL_SEQ_LEN,
-                        HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
-                        ALLOW_TF32=ALLOW_TF32,
-                        BLOCK_D_Q=BLOCK_D_Q,
-                        BLOCK_D_V=BLOCK_D_V,
-                        BLOCK_N=BLOCK_N,
-                        ENABLE_TMA=ENABLE_TMA,
-                    )
-                    if not ENABLE_TMA:
-                        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-                        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+        # if HAS_MULTIPLE_TARGETS:
+        #     # pyre-ignore[61]
+        #     if uih_end < start_m:
+        #         low_delta = start_m
+        #         high_delta = start_m + BLOCK_M
+        #         offset = (low_delta - end_n).to(tl.int32)
+        #         if not ENABLE_TMA:
+        #             K_block_ptr = tl.advance(K_block_ptr, (0, offset))
+        #             V_block_ptr = tl.advance(V_block_ptr, (offset, 0))
+        #         for start_delta in tl.range(
+        #             low_delta, high_delta, BLOCK_N, num_stages=0
+        #         ):
+        #             acc += _hstu_attn_fwd_one_block(
+        #                 start_n=start_delta,
+        #                 seq_len=seq_len,
+        #                 offs_m=offs_m,
+        #                 offs_n=offs_n + start_delta,
+        #                 q=q,
+        #                 K=K,
+        #                 V=V,
+        #                 K_block_ptr=K_block_ptr,
+        #                 V_block_ptr=V_block_ptr,
+        #                 device_desc_k=device_desc_k,
+        #                 device_desc_v=device_desc_v,
+        #                 offset_kh=off_h * stride_kh,
+        #                 offset_vh=off_h * stride_vh,
+        #                 seq_start=seq_start,
+        #                 n_targets=n_targets if HAS_MULTIPLE_TARGETS else None,
+        #                 alpha=alpha,
+        #                 MAX_SEQ_LEN=MAX_SEQ_LEN,
+        #                 contextual_seq_len=contextual_seq_len,
+        #                 max_attn_len=max_attn_len,
+        #                 HAS_MULTIPLE_TARGETS=HAS_MULTIPLE_TARGETS,
+        #                 HAS_CONTEXTUAL_SEQ_LEN=HAS_CONTEXTUAL_SEQ_LEN,
+        #                 HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
+        #                 ALLOW_TF32=ALLOW_TF32,
+        #                 BLOCK_D_Q=BLOCK_D_Q,
+        #                 BLOCK_D_V=BLOCK_D_V,
+        #                 BLOCK_N=BLOCK_N,
+        #                 ENABLE_TMA=ENABLE_TMA,
+        #             )
+        #             if not ENABLE_TMA:
+        #                 K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+        #                 V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         if not ENABLE_TMA:
             if IS_DELTA_Q:
                 start_m_delta = pid * BLOCK_M
@@ -496,6 +497,7 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
     BLOCK_D_V: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    NUM_BUFFERS: tl.constexpr,  #
 ):
     seq_start = tl.load(seq_offsets + off_z).to(tl.int64)
     off_h = off_h.to(tl.int64)
@@ -503,14 +505,46 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
     seq_end = tl.load(seq_offsets + off_z + 1)
     seq_len = (seq_end - seq_start).to(tl.int32)
 
-
     start_m = pid * BLOCK_M
     if start_m >= seq_len:
         return
+
+    # allocate buffers
+    q_tiles = tlx.local_alloc((BLOCK_M, BLOCK_D_Q), tlx.dtype_of(Q), 1)
+    k_tiles = tlx.local_alloc((BLOCK_N, BLOCK_D_Q), tlx.dtype_of(K), NUM_BUFFERS)
+    v_tiles = tlx.local_alloc((BLOCK_N, BLOCK_D_V), tlx.dtype_of(V), NUM_BUFFERS)
+
+    # allocate barriers
+    q_fulls = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    k_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
+    v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
+
     n_targets = tl.load(num_targets + off_z).to(tl.int32)
     # initialize offsets
     offs_m = start_m + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
+
+
+    device_desc_q = tl.make_tensor_descriptor(
+        Q,
+        shape=[seq_end.to(tl.int32), H * DimQ],
+        strides=[H * DimQ, 1],
+        block_shape=[BLOCK_M, BLOCK_D_Q],
+    )
+
+    q_full = tlx.local_view(q_fulls, 0)
+    tlx.barrier_expect_bytes(q_full, 2 * BLOCK_M * BLOCK_D_Q)  # float16
+    q_tile = tlx.local_view(q_tiles, 0)
+    tlx.async_descriptor_load(
+        device_desc_q,
+        q_tile,
+        [
+            (seq_start + start_m).to(tl.int32),
+            (off_h * stride_qh).to(tl.int32),
+        ],
+        q_full
+    )
+
     device_desc_k = tl.make_tensor_descriptor(
         K,
         shape=[seq_end.to(tl.int32), H * DimQ],
@@ -525,20 +559,9 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
         block_shape=[BLOCK_N, BLOCK_D_V],
     )
 
-    device_desc_q = tl.make_tensor_descriptor(
-        Q,
-        shape=[seq_end.to(tl.int32), H * DimQ],
-        strides=[H * DimQ, 1],
-        block_shape=[BLOCK_M, BLOCK_D_Q],
-    )
-    q = device_desc_q.load(
-        [
-            (seq_start + start_m).to(tl.int32),
-            (off_h * stride_qh).to(tl.int32),
-        ]
-    )
+    offset_kh = off_h * stride_kh
+    offset_vh = off_h * stride_vh
 
-    acc = tl.zeros([BLOCK_M, BLOCK_D_V], dtype=tl.float32)
     uih_end = seq_len - n_targets
     low = 0
     high = start_m + BLOCK_M
@@ -546,22 +569,57 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
     if uih_end < start_m:
         high = seq_len - n_targets
 
+    # prefetch (pipelining) for NUM_BUFFERS - 1 buffers
+    for i in tl.range(0, NUM_BUFFERS - 1, loop_unroll_factor=NUM_BUFFERS - 1):
+        start_n = i * BLOCK_N
+        pred = start_n < high
+        # load K
+        k_full = tlx.local_view(k_fulls, i)
+        k_tile = tlx.local_view(k_tiles, i)
+        tlx.barrier_expect_bytes(k_full, 2 * BLOCK_N * BLOCK_D_Q, pred)  # float16
+        tlx.async_descriptor_load(device_desc_k, k_tile, [(seq_start + start_n).to(tl.int32), offset_kh.to(tl.int32)], k_full, pred)
+
+        # load V
+        v_full = tlx.local_view(v_fulls, i)
+        v_tile = tlx.local_view(v_tiles, i)
+        tlx.barrier_expect_bytes(v_full, 2 * BLOCK_N * BLOCK_D_V, pred)  # float16
+        tlx.async_descriptor_load(device_desc_v, v_tile, [(seq_start + start_n).to(tl.int32), offset_vh.to(tl.int32)], v_full, pred)
+
+
+    acc = tl.zeros([BLOCK_M, BLOCK_D_V], dtype=tl.float32)
+
+
     end_n = low
     orignal_off_n = offs_n
     orignal_off_m = offs_m
-    offset_kh = off_h * stride_kh
-    offset_vh = off_h * stride_vh
+
+    # wait for the Q buffer to be populated by the producer
+    tlx.barrier_wait(q_full, phase = 0)
+    q_tile = tlx.local_view(q_tiles, 0)
+
+    kv_phase = 1
+    acc_cnt = 0
     for start in range(low, high, BLOCK_N):
         start_n = tl.multiple_of(start, BLOCK_N)
         offs_n = orignal_off_n + start_n
         offs_m = orignal_off_m
 
-        # -- compute qk ----
-        k = device_desc_k.load(
-            [(seq_start + start_n).to(tl.int32), offset_kh.to(tl.int32)],
-        )
+        buf_id = acc_cnt % NUM_BUFFERS
+        # buffers in a row share the same phase
+        kv_phase = kv_phase ^ (buf_id == 0)
+
+        # wait for the K buffer to be populated by the producer
+        k_full = tlx.local_view(k_fulls, buf_id)
+        tlx.barrier_wait(k_full, kv_phase)
+        k_tile = tlx.local_view(k_tiles, buf_id)
+
+
         # tma can only be loaded in one order, use trans afterwards
-        qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32) * alpha
+        k_tile = tlx.local_trans(k_tile)
+        qk = tlx.async_dot(q_tile, k_tile)
+        # wait for the MMA using to complete
+        qk = tlx.async_dot_wait(0, qk)
+        qk = qk * alpha
         invalid_mask = offs_m[:, None] == offs_n[None, :]
         max_ids = seq_len
         max_ids = max_ids - n_targets
@@ -579,51 +637,76 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
         invalid_mask = invalid_mask or (offs_m_minus_n > 0)
         silu = fast_dividef(qk, 1.0 + tl.exp(-qk)) * (1.0 / MAX_SEQ_LEN)
         silu = tl.where(invalid_mask, silu, 0)
-        v = device_desc_v.load(
-            [(seq_start + start_n).to(tl.int32), offset_vh.to(tl.int32)],
-        )
-        silu = silu.to(v.dtype)
-        acc += tl.dot(silu, v, allow_tf32=ALLOW_TF32)
+        silu = silu.to(tlx.dtype_of(V))
+
+        # wait for the V buffer to be populated by the producer
+        v_full = tlx.local_view(v_fulls, buf_id)
+        tlx.barrier_wait(v_full, kv_phase)
+        v_tile = tlx.local_view(v_tiles, buf_id)
+        acc = tlx.async_dot(silu, v_tile, acc)
+        acc = tlx.async_dot_wait(1, acc)
+
         end_n += BLOCK_N
 
-    # pyre-ignore[61]
-    if uih_end < start_m:
-        low_delta = start_m
-        high_delta = start_m + BLOCK_M
-        for start_delta in tl.range(
-            low_delta, high_delta, BLOCK_N, num_stages=0
-        ):
-            start_n = tl.multiple_of(start_delta, BLOCK_N)
-            offs_n = orignal_off_n + start_n
-            offs_m = orignal_off_m
-            # -- compute qk ----
-            k = device_desc_k.load(
-                [(seq_start + start_n).to(tl.int32), offset_kh.to(tl.int32)],
-            )
-            # tma can only be loaded in one order, use trans afterwards
-            qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32) * alpha
-            invalid_mask = offs_m[:, None] == offs_n[None, :]
-            max_ids = seq_len
-            max_ids = max_ids - n_targets
-            offs_m = tl.where(
-                offs_m < max_ids,
-                offs_m,
-                max_ids,
-            )
-            offs_n = tl.where(
-                offs_n < max_ids,
-                offs_n,
-                max_ids,
-            )
-            offs_m_minus_n = offs_m[:, None] - offs_n[None, :]
-            invalid_mask = invalid_mask or (offs_m_minus_n > 0)
-            silu = fast_dividef(qk, 1.0 + tl.exp(-qk)) * (1.0 / MAX_SEQ_LEN)
-            silu = tl.where(invalid_mask, silu, 0)
-            v = device_desc_v.load(
-                [(seq_start + start_n).to(tl.int32), offset_vh.to(tl.int32)],
-            )
-            silu = silu.to(v.dtype)
-            acc += tl.dot(silu, v, allow_tf32=ALLOW_TF32)
+        # prefetch for i-th iteration, i.e, NUM_BUFFERS - 1 ahead
+        next_buf_id = (acc_cnt + NUM_BUFFERS - 1) % NUM_BUFFERS
+        pred = start < high - BLOCK_N * (NUM_BUFFERS - 1)
+        next_start_n = tl.multiple_of(start + BLOCK_N, BLOCK_N)
+
+        # prefetch K
+        k_full = tlx.local_view(k_fulls, next_buf_id)
+        k_tile = tlx.local_view(k_tiles, next_buf_id)
+        tlx.barrier_expect_bytes(k_full, 2 * BLOCK_N * BLOCK_D_Q, pred)  # float16
+        tlx.async_descriptor_load(device_desc_k, k_tile, [(seq_start + next_start_n).to(tl.int32), offset_kh.to(tl.int32)], k_full, pred)
+
+        # prefetch V
+        v_full = tlx.local_view(v_fulls, next_buf_id)
+        v_tile = tlx.local_view(v_tiles, next_buf_id)
+        tlx.barrier_expect_bytes(v_full, 2 * BLOCK_N * BLOCK_D_V, pred)  # float16
+        tlx.async_descriptor_load(device_desc_v, v_tile, [(seq_start + next_start_n).to(tl.int32), offset_vh.to(tl.int32)], v_full, pred)
+
+        acc_cnt += 1
+
+    # # pyre-ignore[61]
+    # if uih_end < start_m:
+    #     low_delta = start_m
+    #     high_delta = start_m + BLOCK_M
+    #     q_tile = tlx.local_view(q_tiles, 0)
+    #     q = tlx.local_load(q_tile)
+    #     for start_delta in tl.range(
+    #         low_delta, high_delta, BLOCK_N, num_stages=0
+    #     ):
+    #         start_n = tl.multiple_of(start_delta, BLOCK_N)
+    #         offs_n = orignal_off_n + start_n
+    #         offs_m = orignal_off_m
+    #         # -- compute qk ----
+    #         k = device_desc_k.load(
+    #             [(seq_start + start_n).to(tl.int32), offset_kh.to(tl.int32)],
+    #         )
+    #         # tma can only be loaded in one order, use trans afterwards
+    #         qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32) * alpha
+    #         invalid_mask = offs_m[:, None] == offs_n[None, :]
+    #         max_ids = seq_len
+    #         max_ids = max_ids - n_targets
+    #         offs_m = tl.where(
+    #             offs_m < max_ids,
+    #             offs_m,
+    #             max_ids,
+    #         )
+    #         offs_n = tl.where(
+    #             offs_n < max_ids,
+    #             offs_n,
+    #             max_ids,
+    #         )
+    #         offs_m_minus_n = offs_m[:, None] - offs_n[None, :]
+    #         invalid_mask = invalid_mask or (offs_m_minus_n > 0)
+    #         silu = fast_dividef(qk, 1.0 + tl.exp(-qk)) * (1.0 / MAX_SEQ_LEN)
+    #         silu = tl.where(invalid_mask, silu, 0)
+    #         v = device_desc_v.load(
+    #             [(seq_start + start_n).to(tl.int32), offset_vh.to(tl.int32)],
+    #         )
+    #         silu = silu.to(v.dtype)
+    #         acc += tl.dot(silu, v, allow_tf32=ALLOW_TF32)
 
     # Important: must cast to proper dtype. If acc is float32, but
     # TMA descriptor specifies float16, the program will run
@@ -697,6 +780,7 @@ def _hstu_attn_fwd(  # noqa C901
     ENABLE_TMA: tl.constexpr,
     TMA_DESC_SIZE: tl.constexpr,
     USE_TLX: tl.constexpr,
+    NUM_BUFFERS: tl.constexpr,  #
 ):
     off_hz = tl.program_id(1)
     off_z = off_hz // H
@@ -734,6 +818,7 @@ def _hstu_attn_fwd(  # noqa C901
             BLOCK_D_V=BLOCK_D_V,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
+            NUM_BUFFERS=NUM_BUFFERS,
         )
     else:
         _hstu_attn_fwd_compute(
