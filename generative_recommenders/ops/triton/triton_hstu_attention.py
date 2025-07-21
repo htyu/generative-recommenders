@@ -65,7 +65,7 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
         configs = [
             triton.Config(
                 {"BLOCK_M": 128, "BLOCK_N": 32, "USE_TLX": True, "NUM_BUFFERS" : 4},
-                num_stages=0,
+                num_stages=4,
                 num_warps=8,
             ),
 
@@ -552,13 +552,6 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
         block_shape=[BLOCK_N, BLOCK_D_Q],
     )
 
-    device_desc_v = tl.make_tensor_descriptor(
-        V,
-        shape=[seq_end.to(tl.int32), H * DimV],
-        strides=[H * DimV, 1],
-        block_shape=[BLOCK_N, BLOCK_D_V],
-    )
-
     offset_kh = off_h * stride_kh
     offset_vh = off_h * stride_vh
 
@@ -569,8 +562,31 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
     if uih_end < start_m:
         high = seq_len - n_targets
 
+    i = 0
+    start_n = i * BLOCK_N
+    pred = start_n < high
+    # load K
+    k_full = tlx.local_view(k_fulls, i)
+    k_tile = tlx.local_view(k_tiles, i)
+    tlx.barrier_expect_bytes(k_full, 2 * BLOCK_N * BLOCK_D_Q, pred)  # float16
+    tlx.async_descriptor_load(device_desc_k, k_tile, [(seq_start + start_n).to(tl.int32), offset_kh.to(tl.int32)], k_full, pred)
+
+    device_desc_v = tl.make_tensor_descriptor(
+        V,
+        shape=[seq_end.to(tl.int32), H * DimV],
+        strides=[H * DimV, 1],
+        block_shape=[BLOCK_N, BLOCK_D_V],
+    )
+
+    # load V
+    v_full = tlx.local_view(v_fulls, i)
+    v_tile = tlx.local_view(v_tiles, i)
+    tlx.barrier_expect_bytes(v_full, 2 * BLOCK_N * BLOCK_D_V, pred)  # float16
+    tlx.async_descriptor_load(device_desc_v, v_tile, [(seq_start + start_n).to(tl.int32), offset_vh.to(tl.int32)], v_full, pred)
+
+
     # prefetch (pipelining) for NUM_BUFFERS - 1 buffers
-    for i in tl.range(0, NUM_BUFFERS - 1, loop_unroll_factor=NUM_BUFFERS - 1):
+    for i in tl.range(1, NUM_BUFFERS - 1, loop_unroll_factor=NUM_BUFFERS - 1):
         start_n = i * BLOCK_N
         pred = start_n < high
         # load K
@@ -597,37 +613,95 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
     tlx.barrier_wait(q_full, phase = 0)
     q_tile = tlx.local_view(q_tiles, 0)
 
-    kv_phase = 1
-    acc_cnt = 0
-    for start in range(low, high, BLOCK_N):
+    # kv_phase = 1
+    k_phase = 0
+    v_phase = 1
+    k_buf_id = 0
+    v_buf_id = 0
+
+
+    start_n = tl.multiple_of(low, BLOCK_N)
+    offs_n = orignal_off_n + start_n
+    offs_m = orignal_off_m
+
+    # wait for the K buffer to be populated by the producer
+    k_full = tlx.local_view(k_fulls, k_buf_id)
+    tlx.barrier_wait(k_full, k_phase)
+    k_tile = tlx.local_view(k_tiles, k_buf_id)
+
+
+    # tma can only be loaded in one order, use trans afterwards
+    k_tile = tlx.local_trans(k_tile)
+    qk = tlx.async_dot(q_tile, k_tile)
+    # wait for the MMA using to complete
+    qk = tlx.async_dot_wait(0, qk)
+
+     # prefetch K
+    k_full = tlx.local_view(k_fulls, NUM_BUFFERS - 1)
+    k_tile = tlx.local_view(k_tiles, NUM_BUFFERS - 1)
+    tlx.barrier_expect_bytes(k_full, 2 * BLOCK_N * BLOCK_D_Q)  # float16
+    tlx.async_descriptor_load(device_desc_k, k_tile, [(seq_start + start_n).to(tl.int32), offset_kh.to(tl.int32)], k_full)
+
+
+
+    qk = qk * alpha
+    invalid_mask = offs_m[:, None] == offs_n[None, :]
+    max_ids = seq_len
+    max_ids = max_ids - n_targets
+    offs_m = tl.where(
+        offs_m < max_ids,
+        offs_m,
+        max_ids,
+    )
+    offs_n = tl.where(
+        offs_n < max_ids,
+        offs_n,
+        max_ids,
+    )
+    offs_m_minus_n = offs_m[:, None] - offs_n[None, :]
+    invalid_mask = invalid_mask or (offs_m_minus_n > 0)
+    silu = fast_dividef(qk, 1.0 + tl.exp(-qk)) * (1.0 / MAX_SEQ_LEN)
+    silu = tl.where(invalid_mask, silu, 0)
+    silu = silu.to(tlx.dtype_of(V))
+
+
+    acc_cnt = 1
+
+
+    for start in range(low + BLOCK_N, high, BLOCK_N):
         start_n = tl.multiple_of(start, BLOCK_N)
         offs_n = orignal_off_n + start_n
-        offs_m = orignal_off_m
 
-        buf_id = acc_cnt % NUM_BUFFERS
+        k_buf_id = acc_cnt % NUM_BUFFERS
         # buffers in a row share the same phase
-        kv_phase = kv_phase ^ (buf_id == 0)
+        k_phase = k_phase ^ (k_buf_id == 0)
 
         # wait for the K buffer to be populated by the producer
-        k_full = tlx.local_view(k_fulls, buf_id)
-        tlx.barrier_wait(k_full, kv_phase)
-        k_tile = tlx.local_view(k_tiles, buf_id)
-
+        k_full = tlx.local_view(k_fulls, k_buf_id)
+        tlx.barrier_wait(k_full, k_phase)
+        k_tile2 = tlx.local_view(k_tiles, k_buf_id)
 
         # tma can only be loaded in one order, use trans afterwards
-        k_tile = tlx.local_trans(k_tile)
-        qk = tlx.async_dot(q_tile, k_tile)
+        k_tile2 = tlx.local_trans(k_tile2)
+        qk = tlx.async_dot(q_tile, k_tile2)
         # wait for the MMA using to complete
-        qk = tlx.async_dot_wait(0, qk)
+        qk = tlx.async_dot_wait(1, qk)
+        prev_silu = silu
+
+        # wait for the previous V buffer to be populated by the producer
+        v_buf_id = (acc_cnt - 1) % NUM_BUFFERS
+        v_phase = v_phase ^ (v_buf_id == 0)
+        v_full = tlx.local_view(v_fulls, v_buf_id)
+        tlx.barrier_wait(v_full, v_phase)
+        v_tile = tlx.local_view(v_tiles, v_buf_id)
+        acc = tlx.async_dot(prev_silu, v_tile, acc)
+        acc = tlx.async_dot_wait(1, acc)
+
+
         qk = qk * alpha
         invalid_mask = offs_m[:, None] == offs_n[None, :]
         max_ids = seq_len
         max_ids = max_ids - n_targets
-        offs_m = tl.where(
-            offs_m < max_ids,
-            offs_m,
-            max_ids,
-        )
         offs_n = tl.where(
             offs_n < max_ids,
             offs_n,
@@ -639,33 +713,38 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
         silu = tl.where(invalid_mask, silu, 0)
         silu = silu.to(tlx.dtype_of(V))
 
-        # wait for the V buffer to be populated by the producer
-        v_full = tlx.local_view(v_fulls, buf_id)
-        tlx.barrier_wait(v_full, kv_phase)
-        v_tile = tlx.local_view(v_tiles, buf_id)
-        acc = tlx.async_dot(silu, v_tile, acc)
-        acc = tlx.async_dot_wait(1, acc)
-
-        end_n += BLOCK_N
 
         # prefetch for i-th iteration, i.e, NUM_BUFFERS - 1 ahead
-        next_buf_id = (acc_cnt + NUM_BUFFERS - 1) % NUM_BUFFERS
+        next_k_buf_id = (acc_cnt + NUM_BUFFERS - 1) % NUM_BUFFERS
         pred = start < high - BLOCK_N * (NUM_BUFFERS - 1)
         next_start_n = tl.multiple_of(start + BLOCK_N, BLOCK_N)
-
-        # prefetch K
-        k_full = tlx.local_view(k_fulls, next_buf_id)
-        k_tile = tlx.local_view(k_tiles, next_buf_id)
-        tlx.barrier_expect_bytes(k_full, 2 * BLOCK_N * BLOCK_D_Q, pred)  # float16
-        tlx.async_descriptor_load(device_desc_k, k_tile, [(seq_start + next_start_n).to(tl.int32), offset_kh.to(tl.int32)], k_full, pred)
+        k_full = tlx.local_view(k_fulls, next_k_buf_id)
+        k_tile2 = tlx.local_view(k_tiles, next_k_buf_id)
+        tlx.barrier_expect_bytes(k_full, 2 * BLOCK_N * BLOCK_D_Q)  # float16
+        tlx.async_descriptor_load(device_desc_k, k_tile2, [(seq_start + next_start_n).to(tl.int32), offset_kh.to(tl.int32)], k_full)
 
         # prefetch V
-        v_full = tlx.local_view(v_fulls, next_buf_id)
-        v_tile = tlx.local_view(v_tiles, next_buf_id)
-        tlx.barrier_expect_bytes(v_full, 2 * BLOCK_N * BLOCK_D_V, pred)  # float16
-        tlx.async_descriptor_load(device_desc_v, v_tile, [(seq_start + next_start_n).to(tl.int32), offset_vh.to(tl.int32)], v_full, pred)
+        next_v_buf_id = (acc_cnt + NUM_BUFFERS - 2) % NUM_BUFFERS
+        v_full = tlx.local_view(v_fulls, next_v_buf_id)
+        v_tile = tlx.local_view(v_tiles, next_v_buf_id)
+        tlx.barrier_expect_bytes(v_full, 2 * BLOCK_N * BLOCK_D_V)  # float16
+        tlx.async_descriptor_load(device_desc_v, v_tile, [(seq_start + next_start_n).to(tl.int32), offset_vh.to(tl.int32)], v_full)
 
+        end_n += BLOCK_N
         acc_cnt += 1
+
+
+    # wait for the V buffer to be populated by the producer
+    v_buf_id = (acc_cnt - 1) % NUM_BUFFERS
+    v_phase = v_phase ^ (v_buf_id == 0)
+    v_full = tlx.local_view(v_fulls, v_buf_id)
+    # tlx.barrier_wait(v_full, v_buf_id)
+    v_tile = tlx.local_view(v_tiles, v_buf_id)
+    acc = tlx.async_dot(silu, v_tile, acc)
+    acc = tlx.async_dot_wait(1, acc)
+
+
+
 
     # # pyre-ignore[61]
     # if uih_end < start_m:
