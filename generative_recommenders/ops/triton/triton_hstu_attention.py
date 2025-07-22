@@ -603,43 +603,93 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
             q_tile = tlx.local_view(q_tiles, cid)
 
 
-            # loop over k, v and update accumulator
-            kv_phase = 1
-            acc_cnt = 0
-            for start in range(low, high, BLOCK_N):
-                buf_id = acc_cnt % NUM_BUFFERS
-                # buffers in a row share the same phase
-                kv_phase = kv_phase ^ (buf_id == 0)
+            k_phase = 0
+            v_phase = 1
+            k_buf_id = 0
+            v_buf_id = 0
 
+
+            start_n = tl.multiple_of(low, BLOCK_N)
+            offs_n = orignal_off_n + start_n
+            offs_m = orignal_off_m
+
+            # wait for the K buffer to be populated by the producer
+            k_full = tlx.local_view(k_fulls, k_buf_id)
+            tlx.barrier_wait(k_full, k_phase)
+            k_tile = tlx.local_view(k_tiles, k_buf_id)
+
+
+            # tma can only be loaded in one order, use trans afterwards
+            k_tile = tlx.local_trans(k_tile)
+            qk = tlx.async_dot(q_tile, k_tile)
+            # wait for the MMA using to complete
+            qk = tlx.async_dot_wait(0, qk)
+            # release the K buffer
+            k_empty = tlx.local_view(k_empties, k_buf_id)
+            tlx.barrier_arrive(k_empty, 1)
+
+            qk = qk * alpha
+
+
+            invalid_mask = offs_m[:, None] == offs_n[None, :]
+            max_ids = seq_len
+            max_ids = max_ids - n_targets
+            offs_m = tl.where(
+                offs_m < max_ids,
+                offs_m,
+                max_ids,
+            )
+            offs_n = tl.where(
+                offs_n < max_ids,
+                offs_n,
+                max_ids,
+            )
+            offs_m_minus_n = offs_m[:, None] - offs_n[None, :]
+            invalid_mask = invalid_mask or (offs_m_minus_n > 0)
+            silu = fast_dividef(qk, 1.0 + tl.exp(-qk)) * (1.0 / MAX_SEQ_LEN)
+            silu = tl.where(invalid_mask, silu, 0)
+            silu = silu.to(tlx.dtype_of(V))
+
+
+            acc_cnt = 1
+
+
+            for start in range(low + BLOCK_N, high, BLOCK_N):
                 start_n = tl.multiple_of(start, BLOCK_N)
                 offs_n = orignal_off_n + start_n
-                offs_m = orignal_off_m
+
+                k_buf_id = acc_cnt % NUM_BUFFERS
+                # buffers in a row share the same phase
+                k_phase = k_phase ^ (k_buf_id == 0)
 
                 # wait for the K buffer to be populated by the producer
-                k_full = tlx.local_view(k_fulls, buf_id)
-                tlx.barrier_wait(k_full, kv_phase)
-                k_tile = tlx.local_view(k_tiles, buf_id)
+                k_full = tlx.local_view(k_fulls, k_buf_id)
+                tlx.barrier_wait(k_full, k_phase)
+                k_tile = tlx.local_view(k_tiles, k_buf_id)
 
                 # tma can only be loaded in one order, use trans afterwards
                 k_tile = tlx.local_trans(k_tile)
                 qk = tlx.async_dot(q_tile, k_tile)
                 # wait for the MMA using to complete
-                qk = tlx.async_dot_wait(0, qk)
+                prev_silu = silu
+
+                # wait for the previous V buffer to be populated by the producer
+                v_buf_id = (acc_cnt - 1) % NUM_BUFFERS
+                v_phase = v_phase ^ (v_buf_id == 0)
+                v_full = tlx.local_view(v_fulls, v_buf_id)
+                tlx.barrier_wait(v_full, v_phase)
+                v_tile = tlx.local_view(v_tiles, v_buf_id)
+                acc = tlx.async_dot(prev_silu, v_tile, acc)
+                qk = tlx.async_dot_wait(1, qk)
+
                 # release the K buffer
-                k_empty = tlx.local_view(k_empties, buf_id)
+                k_empty = tlx.local_view(k_empties, k_buf_id)
                 tlx.barrier_arrive(k_empty, 1)
 
                 qk = qk * alpha
-
-
                 invalid_mask = offs_m[:, None] == offs_n[None, :]
                 max_ids = seq_len
                 max_ids = max_ids - n_targets
-                offs_m = tl.where(
-                    offs_m < max_ids,
-                    offs_m,
-                    max_ids,
-                )
                 offs_n = tl.where(
                     offs_n < max_ids,
                     offs_n,
@@ -651,26 +701,35 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
                 silu = tl.where(invalid_mask, silu, 0)
                 silu = silu.to(tlx.dtype_of(V))
 
-                # wait for the V buffer to be populated by the producer
-                v_full = tlx.local_view(v_fulls, buf_id)
-                tlx.barrier_wait(v_full, kv_phase)
-                v_tile = tlx.local_view(v_tiles, buf_id)
-                acc = tlx.async_dot(silu, v_tile, acc)
-                # wait for the MMA using to complete
                 acc = tlx.async_dot_wait(0, acc)
-                # release the V buffer
-                v_empty = tlx.local_view(v_empties, buf_id)
+                                # release the V buffer
+                v_empty = tlx.local_view(v_empties, v_buf_id)
                 tlx.barrier_arrive(v_empty, 1)
 
-                end_n += BLOCK_N
 
-                # increment loop trip counts
+                end_n += BLOCK_N
                 acc_cnt += 1
+
+
+            # wait for the V buffer to be populated by the producer
+            v_buf_id = (acc_cnt - 1) % NUM_BUFFERS
+            v_phase = v_phase ^ (v_buf_id == 0)
+            v_full = tlx.local_view(v_fulls, v_buf_id)
+            # tlx.barrier_wait(v_full, v_buf_id)
+            v_tile = tlx.local_view(v_tiles, v_buf_id)
+            tlx.barrier_wait(v_full, v_phase)
+            acc = tlx.async_dot(silu, v_tile, acc)
+            acc = tlx.async_dot_wait(0, acc)
+            # release the V buffer
+            v_empty = tlx.local_view(v_empties, v_buf_id)
+            tlx.barrier_arrive(v_empty, 1)
+
 
             # pyre-ignore[61]
             if uih_end < start_m:
                 low_delta = start_m
                 high_delta = start_m + BLOCK_M
+                kv_phase = k_phase
                 for start in tl.range(
                     low_delta, high_delta, BLOCK_N, num_stages=0
                 ):
