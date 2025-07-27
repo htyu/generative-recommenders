@@ -660,7 +660,24 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
 
             # tma can only be loaded in one order, use trans afterwards
             k_tile = tlx.local_trans(k_tile)
+
+            if cid == 0:
+                # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
+                tlx.named_barrier_wait(9, 256)
+            else:
+                # Consumer 1 signals its arrival at barrier 9.
+                tlx.named_barrier_arrive(9, 256)
+                # Then waits at barrier 10 until Consumer 0 finishes issuing its async_dot.
+                tlx.named_barrier_wait(10, 256)
+
+
             qk = tlx.async_dot(q_tile, k_tile)
+
+            if cid == 0:
+                # After issuing async_dot, Consumer 0 signals barrier 10 to unblock Consumer 1.
+                tlx.named_barrier_arrive(10, 256)
+
+
             # wait for the MMA using to complete
             qk = tlx.async_dot_wait(0, qk)
             # release the K buffer
