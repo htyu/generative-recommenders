@@ -32,7 +32,7 @@ from generative_recommenders.common import (
     triton_autotune,
 )
 
-from triton.language.extra.libdevice import fast_dividef  # @manual=//triton:triton
+from triton.language.extra.libdevice import fast_dividef, fast_expf  # @manual=//triton:triton
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 try:
@@ -702,8 +702,9 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
             )
             offs_m_minus_n = offs_m[:, None] - offs_n[None, :]
             invalid_mask = invalid_mask or (offs_m_minus_n > 0)
-            silu = fast_dividef(qk, 1.0 + tl.exp(-qk)) * (1.0 / MAX_SEQ_LEN)
-            silu = tl.where(invalid_mask, silu, 0)
+            scale = tl.where(invalid_mask, (1.0 / MAX_SEQ_LEN), 0.0)
+            silu = fast_dividef(qk, 1.0 + fast_expf(-qk)) * scale
+            # silu = tl.where(invalid_mask, silu, 0)
             silu = silu.to(tlx.dtype_of(V))
 
 
@@ -755,7 +756,8 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
                 )
                 offs_m_minus_n = offs_m[:, None] - offs_n[None, :]
                 invalid_mask = invalid_mask or (offs_m_minus_n > 0)
-                silu = fast_dividef(qk, 1.0 + tl.exp(-qk)) * (1.0 / MAX_SEQ_LEN)
+                scale = tl.where(invalid_mask, 0.0, (1.0 / MAX_SEQ_LEN))
+                silu = fast_dividef(qk, 1.0 + fast_expf(-qk)) * scale
                 silu = tl.where(invalid_mask, silu, 0)
                 silu = silu.to(tlx.dtype_of(V))
 
